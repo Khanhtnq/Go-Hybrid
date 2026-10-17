@@ -283,6 +283,8 @@ pub(crate) struct FnState {
             hy_syntax::Block,
         ),
     >,
+    /// Issue #429: closure binding -> `(const_name, file_const_root)` when the closure's body returns storage backed by a `const` composite.
+    pub(crate) closure_returns_const: HashMap<String, (String, Option<String>)>,
     /// Declared result shapes of the function being checked (rule N1's
     /// return-site nil checks). Empty for closure bodies (fn literals
     /// carry no result types on the AST surface yet).
