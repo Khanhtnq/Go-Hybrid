@@ -731,8 +731,10 @@ impl<'a> Lexer<'a> {
     fn lex_str_segment(&mut self, emitted_any: bool) -> Option<Token> {
         let start = self.pos();
         let mut cooked = String::new();
+        let mut byte_buf: Vec<u8> = Vec::new();
         loop {
             let Some(c) = self.at(0) else {
+                flush_escape_bytes(&mut cooked, &mut byte_buf);
                 self.frames.pop();
                 self.diag(PARSE_ERR_CODE, start, "unterminated string literal");
                 if cooked.is_empty() && emitted_any {
@@ -743,6 +745,7 @@ impl<'a> Lexer<'a> {
             };
             match c {
                 '"' => {
+                    flush_escape_bytes(&mut cooked, &mut byte_buf);
                     self.bump();
                     self.frames.pop();
                     if cooked.is_empty() && emitted_any {
@@ -752,6 +755,7 @@ impl<'a> Lexer<'a> {
                     return Some(self.tok(start, Tok::StrChunk(cooked)));
                 }
                 '{' => {
+                    flush_escape_bytes(&mut cooked, &mut byte_buf);
                     if self.at(1) == Some('{') {
                         self.bump();
                         self.bump();
@@ -771,6 +775,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 '}' => {
+                    flush_escape_bytes(&mut cooked, &mut byte_buf);
                     // `}}` escapes a literal brace; a lone `}` is literal text
                     self.bump();
                     if self.at(0) == Some('}') {
@@ -780,9 +785,14 @@ impl<'a> Lexer<'a> {
                 }
                 '\\' => {
                     self.bump();
-                    match self.escape_char(true) {
-                        Some(e) => cooked.push(e),
+                    match self.escape_unit(true) {
+                        Some(EscapeUnit::Byte(b)) => byte_buf.push(b),
+                        Some(EscapeUnit::Char(e)) => {
+                            flush_escape_bytes(&mut cooked, &mut byte_buf);
+                            cooked.push(e);
+                        }
                         None => {
+                            flush_escape_bytes(&mut cooked, &mut byte_buf);
                             // unknown escape: keep the char verbatim (diag recorded)
                             if let Some(c2) = self.bump() {
                                 cooked.push(c2);
@@ -791,6 +801,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ => {
+                    flush_escape_bytes(&mut cooked, &mut byte_buf);
                     cooked.push(c);
                     self.bump();
                 }
@@ -808,19 +819,26 @@ impl<'a> Lexer<'a> {
     /// mid-escape: the literal loop then runs to EOF and the caller emits
     /// its own `unterminated string/char literal` diagnostic.
     fn escape_char(&mut self, str_mode: bool) -> Option<char> {
+        match self.escape_unit(str_mode)? {
+            EscapeUnit::Char(ch) => Some(ch),
+            EscapeUnit::Byte(b) => Some(b as char),
+        }
+    }
+
+    fn escape_unit(&mut self, str_mode: bool) -> Option<EscapeUnit> {
         let start = self.pos();
         let c = self.bump()?;
         let out = match c {
-            'n' => '\n',
-            't' => '\t',
-            'r' => '\r',
-            '\\' => '\\',
-            '"' => '"',
-            '\'' => '\'',
-            'a' => '\u{7}',
-            'b' => '\u{8}',
-            'f' => '\u{c}',
-            'v' => '\u{b}',
+            'n' => EscapeUnit::Char('\n'),
+            't' => EscapeUnit::Char('\t'),
+            'r' => EscapeUnit::Char('\r'),
+            '\\' => EscapeUnit::Char('\\'),
+            '"' => EscapeUnit::Char('"'),
+            '\'' => EscapeUnit::Char('\''),
+            'a' => EscapeUnit::Char('\u{7}'),
+            'b' => EscapeUnit::Char('\u{8}'),
+            'f' => EscapeUnit::Char('\u{c}'),
+            'v' => EscapeUnit::Char('\u{b}'),
             'x' => {
                 let mut v: u32 = 0;
                 for _ in 0..2 {
@@ -837,8 +855,7 @@ impl<'a> Lexer<'a> {
                     };
                     v = v * 16 + d;
                 }
-                // v <= 0xFF is always a scalar value; from_u32 cannot fail.
-                char::from_u32(v)?
+                EscapeUnit::Byte(v as u8)
             }
             'u' => {
                 if str_mode {
@@ -857,7 +874,7 @@ impl<'a> Lexer<'a> {
                         };
                         v = v * 16 + d;
                     }
-                    self.scalar_or_diag(v, start, str_mode, "\\u")?
+                    EscapeUnit::Char(self.scalar_or_diag(v, start, str_mode, "\\u")?)
                 } else {
                     // rune style: \u{1F600}
                     if self.bump() != Some('{') {
@@ -900,7 +917,7 @@ impl<'a> Lexer<'a> {
                             }
                         }
                     }
-                    self.scalar_or_diag(v, start, str_mode, "\\u{…}")?
+                    EscapeUnit::Char(self.scalar_or_diag(v, start, str_mode, "\\u{…}")?)
                 }
             }
             'U' => {
@@ -919,7 +936,7 @@ impl<'a> Lexer<'a> {
                     };
                     v = v * 16 + d;
                 }
-                self.scalar_or_diag(v, start, str_mode, "\\U")?
+                EscapeUnit::Char(self.scalar_or_diag(v, start, str_mode, "\\U")?)
             }
             '0'..='7' => {
                 // octal \NNN — at most three digits (c plus up to two more),
@@ -942,7 +959,7 @@ impl<'a> Lexer<'a> {
                     );
                     return None;
                 }
-                char::from_u32(v)?
+                EscapeUnit::Byte(v as u8)
             }
             _ => {
                 self.diag(
@@ -990,6 +1007,35 @@ impl<'a> Lexer<'a> {
                 .with_rule(rule),
         );
     }
+}
+
+enum EscapeUnit {
+    Char(char),
+    Byte(u8),
+}
+
+fn flush_escape_bytes(cooked: &mut String, byte_buf: &mut Vec<u8>) {
+    if byte_buf.is_empty() {
+        return;
+    }
+    let mut slice = byte_buf.as_slice();
+    while !slice.is_empty() {
+        match std::str::from_utf8(slice) {
+            Ok(valid) => {
+                cooked.push_str(valid);
+                break;
+            }
+            Err(err) => {
+                let (valid, after_valid) = slice.split_at(err.valid_up_to());
+                if !valid.is_empty() {
+                    cooked.push_str(std::str::from_utf8(valid).unwrap());
+                }
+                cooked.push(after_valid[0] as char);
+                slice = &after_valid[1..];
+            }
+        }
+    }
+    byte_buf.clear();
 }
 
 fn static_punct(c: char) -> &'static str {

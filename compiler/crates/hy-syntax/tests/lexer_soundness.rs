@@ -166,3 +166,41 @@ fn empty_and_multichar_char_literals_fail_closed_without_quote_desync() {
         "multi-char rune literal must recover at closing quote on the same line: {multi_errs:?}"
     );
 }
+
+#[test]
+fn valid_utf8_byte_escapes_decode_as_utf8_not_latin1_scalars_issue_1199() {
+    // Issue #1199: valid UTF-8 byte escape sequences in interpreted strings (`\xNN`, `\NNN`)
+    // must decode to the UTF-8 scalar they encode (Go LX7/T3 semantics), while rune literals
+    // keep code-point semantics (`'\xe9' == '\u{e9}'`).
+    for (src, expected_chunk) in [
+        (r#"fn main() { s := "\xc3\xa9" }"#, "é"),
+        (r#"fn main() { s := "\303\251" }"#, "é"),
+        (r#"fn main() { s := "\xe4\xb8\xad" }"#, "中"),
+        (r#"fn main() { s := "\xf0\x9f\x99\x82" }"#, "🙂"),
+        (r#"fn main() { s := "\x41" }"#, "A"),
+        (r#"fn main() { s := "\u00e9" }"#, "é"),
+        (r#"fn main() { s := "\U0001f642" }"#, "🙂"),
+    ] {
+        let toks = lex("test.hy", src).expect("valid string escape");
+        assert!(
+            toks.iter().any(|t| t.tok == Tok::StrChunk(expected_chunk.into())),
+            "for `{src}`, expected StrChunk({expected_chunk:?}), got: {toks:?}"
+        );
+    }
+
+    // Interpolated string with UTF-8 byte escapes flushes cleanly before `{value}`:
+    let interp_toks = lex("test.hy", r#"fn main() { s := "prefix:\xc3\xa9:{value}" }"#)
+        .expect("valid interpolated string");
+    assert!(
+        interp_toks.iter().any(|t| t.tok == Tok::StrChunk("prefix:é:".into())),
+        "expected StrChunk(prefix:é:), got: {interp_toks:?}"
+    );
+
+    // Rune literals retain code-point semantics for `\xNN` and `\NNN`:
+    let rune_toks = lex("test.hy", r"fn main() { a := '\xe9' b := '\351' }").expect("valid runes");
+    assert_eq!(
+        rune_toks.iter().filter(|t| t.tok == Tok::CharLit('\u{e9}')).count(),
+        2,
+        "expected both `'\\xe9'` and `'\\351'` to lex as CharLit('é'), got: {rune_toks:?}"
+    );
+}
