@@ -37,6 +37,42 @@ impl<'a> Checker<'a> {
         else {
             return;
         };
+        if let Some(is_f32) = is_float_type(ty_name) {
+            if let Some(f) = self.const_float_fold(value, st) {
+                let overflows = if is_f32 {
+                    (f as f32).is_infinite()
+                } else {
+                    f.is_infinite()
+                };
+                if overflows {
+                    let span = value.span();
+                    let msg = format!(
+                        "constant `{}` overflows declared type `{}` of `{}` (HYB-E6002)",
+                        value.render(),
+                        ty_name,
+                        name
+                    );
+                    let notes = vec![
+                        format!(
+                            "why: Go rejects a constant initializer that overflows `{}` (`cannot use {} as {} value (overflows)`), so an accepted Hybrid program would emit unbuildable Go (issue #683)",
+                            ty_name, value.render(), ty_name
+                        ),
+                        format!(
+                            "fix: use a finite `{}` value in range",
+                            ty_name
+                        ),
+                        format!(
+                            "note: the declared type was written here ({})",
+                            span_hint(*ty_span)
+                        ),
+                    ];
+                    self.diags.push(
+                        Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
+                    );
+                }
+            }
+            return;
+        }
         let Some((lo, hi)) = fixed_width_int_range(ty_name) else {
             return;
         };
@@ -134,23 +170,66 @@ impl<'a> Checker<'a> {
 
     /// When `ty` is a fixed-width integer and `value` assigned to `target`
     /// is an integer constant outside that type's range, or a float constant, emit HYB-E6002.
+    ///
+    /// Issue #998: the RHS may be a *named* file-level `const` (`x = k`), so
+    /// the fold must resolve identifiers through the file const map exactly
+    /// like the declaration path does — a bare syntactic fold sees `k` as
+    /// `NotConst` and the accepted-but-unbuildable shape slips through.
     pub(crate) fn check_const_overflow_assign(
         &mut self,
         target: &str,
         ty: &TypeExpr,
         value: &Expr,
+        st: Option<&FnState>,
     ) {
+        let resolved = self.resolve_type_alias(ty);
         let TypeExpr::Named {
             name: ty_name,
             span: ty_span,
-        } = ty
+        } = &resolved
         else {
             return;
         };
+        if let Some(is_f32) = is_float_type(ty_name) {
+            if let Some(f) = self.const_float_fold(value, st) {
+                let overflows = if is_f32 {
+                    (f as f32).is_infinite()
+                } else {
+                    f.is_infinite()
+                };
+                if overflows {
+                    let span = value.span();
+                    let msg = format!(
+                        "constant `{}` overflows declared type `{}` of `{}` (HYB-E6002)",
+                        value.render(),
+                        ty_name,
+                        target
+                    );
+                    let notes = vec![
+                        format!(
+                            "why: Go rejects a constant assignment that overflows `{}` (`cannot use {} as {} value in assignment (overflows)`), so an accepted Hybrid program would emit unbuildable Go (issue #683)",
+                            ty_name, value.render(), ty_name
+                        ),
+                        format!(
+                            "fix: use a finite `{}` value in range",
+                            ty_name
+                        ),
+                        format!(
+                            "note: the declared type was written here ({})",
+                            span_hint(*ty_span)
+                        ),
+                    ];
+                    self.diags.push(
+                        Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
+                    );
+                }
+            }
+            return;
+        }
         let Some((lo, hi)) = fixed_width_int_range(ty_name) else {
             return;
         };
-        match const_int_fold(value) {
+        match const_int_fold_with(value, &self.const_values, 0, st) {
             ConstFold::NotConst => {}
             ConstFold::TooBig => {
                 let span = value.span();
@@ -270,6 +349,44 @@ impl<'a> Checker<'a> {
         self.diags.push(
             Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
         );
+    }
+
+    /// Check untyped float constants in variable declarations without an explicit
+    /// type. Go gives these declarations the default `float64` type.
+    pub(crate) fn check_default_float_overflow(
+        &mut self,
+        name: &str,
+        value: &Expr,
+        st: Option<&FnState>,
+    ) {
+        if !is_float_const_expr(value, &self.const_values, 0, st) {
+            return;
+        }
+        if let Some(f) = self.const_float_fold(value, st) {
+            if f.is_infinite() {
+                let span = value.span();
+                let msg = format!(
+                    "constant expression `{}` overflows default type `float64` of `{}` (HYB-E6002)",
+                    value.render(),
+                    name
+                );
+                let notes = vec![
+                    format!(
+                        "why: Go assigns default type `float64` to an untyped float constant in a variable declaration and rejects values outside float64's range (`cannot use {} as float64 value in assignment (overflows)`), so an accepted Hybrid program would emit unbuildable Go (issue #683)",
+                        value.render()
+                    ),
+                    "fix: use a finite `float64` value in range, or declare an explicit type".to_string(),
+                ];
+                self.diags.push(
+                    Diagnostic::error("HYB-E6002", self.path.clone(), span, msg).with_notes(notes),
+                );
+            }
+        }
+    }
+
+    /// Fold a constant float expression (literals, identifiers, unary, binary).
+    pub(crate) fn const_float_fold(&self, e: &Expr, st: Option<&FnState>) -> Option<f64> {
+        const_float_fold_with(e, &self.const_values, 0, st)
     }
 
     // -----------------------------------------------------------------------
@@ -513,7 +630,7 @@ impl<'a> Checker<'a> {
             ..
         } = callee
         {
-            if items.is_empty() {
+            if items.is_empty() && callee.as_array_lit().is_none() {
                 self.check_slice_conversion(t, arg, span);
                 return;
             }
@@ -792,7 +909,10 @@ impl<'a> Checker<'a> {
         self.diags
             .push(Diagnostic::error("HYB-E6006", self.path.clone(), span, msg).with_notes(notes));
     }
+
+
 }
+
 
 /// A literal-constant conversion operand (the literal-only scope shared with
 /// E6001/E6002). Anything else — idents, binary ops, calls — is out of
@@ -926,6 +1046,19 @@ fn is_f32_target(name: &str) -> bool {
     matches!(name, "f32" | "float32")
 }
 
+/// The built-in float TYPES as spelled in an ascription: `Some(true)` =
+/// float32, `Some(false)` = float64. `f32`/`f64` are accepted alias
+/// spellings (the emitter maps both to float32/float64 — issue #683's
+/// float legs must reject past-range constants under either spelling).
+/// Carried from rickymulya's parallel take #689 (credit).
+fn is_float_type(ty_name: &str) -> Option<bool> {
+    match ty_name {
+        "float32" | "f32" => Some(true),
+        "float64" | "f64" => Some(false),
+        _ => None,
+    }
+}
+
 fn span_hint(span: Span) -> String {
     format!("{}:{}", span.start.line, span.start.col)
 }
@@ -957,7 +1090,7 @@ pub(crate) fn target_uint_range() -> (i128, i128) {
 /// name (SPEC-LANGUAGE §11 / Go's typed-constant assignment rule).
 /// Platform-word `int`/`uint`/`isize`/`usize` use the 64-bit LP64 ranges
 /// the emitter targets (SPEC B9 / X7).
-fn fixed_width_int_range(name: &str) -> Option<(i128, i128)> {
+pub(crate) fn fixed_width_int_range(name: &str) -> Option<(i128, i128)> {
     Some(match name {
         "i8" | "int8" => (i8::MIN as i128, i8::MAX as i128),
         "u8" | "uint8" | "byte" => (0, u8::MAX as i128),
@@ -976,7 +1109,7 @@ fn fixed_width_int_range(name: &str) -> Option<(i128, i128)> {
 /// Parsed integer literal, retaining the fact that a syntactically valid
 /// value exceeded i128 instead of treating it as non-constant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConstInt {
+pub(crate) enum ConstInt {
     Value(i128),
     PosOverflow,
     NegOverflow,
@@ -1057,11 +1190,60 @@ pub(crate) fn const_int_fold_with(
             let r = const_int_fold_with(rhs, consts, depth + 1, st);
             fold_bin(*op, l, r)
         }
+        // A fixed-width integer conversion of a constant is ITSELF a
+        // constant, and SPEC X4 gives it the truncated value: `u8(300)` is
+        // 44, not 300 (`hy-emit`'s `constconv` fold already prints
+        // `uint8(44)` for it, so this only teaches the checker what the
+        // emitter was already doing).
+        //
+        // Without this arm a typed constant expression does not fold at all
+        // — `u8(255) + 1` sees a `Call` on the left, gives up, and the
+        // result-range check downstream has no value to range-check
+        // (issue #725).
+        Expr::Call { callee, args, .. } => {
+            if args.len() != 1 {
+                return ConstFold::NotConst;
+            }
+            let Expr::Ident { name, .. } = unwrap_parens(callee) else {
+                return ConstFold::NotConst;
+            };
+            let Some((lo, hi)) = fixed_width_int_range(name) else {
+                return ConstFold::NotConst;
+            };
+            match const_int_fold_with(&args[0].value, consts, depth + 1, st) {
+                ConstFold::Val(v) => ConstFold::Val(wrap_into(v, lo, hi)),
+                ConstFold::TooBig => ConstFold::TooBig,
+                ConstFold::NotConst => ConstFold::NotConst,
+            }
+        }
         _ => ConstFold::NotConst,
     }
 }
 
-fn fold_bin(op: BinOp, l: ConstFold, r: ConstFold) -> ConstFold {
+/// Two's-complement wrap of `v` into the inclusive range `lo..=hi` — the
+/// value SPEC X4 gives a constant conversion (`u8(300)` -> 44) and SPEC
+/// X1/X2 give run-time arithmetic.
+///
+/// The width is recovered from the range itself, so this needs no second
+/// table of type widths: `u8` is `0..=255`, so the span is 255 and the width
+/// is 8 bits; `i64` is `-2^63..=2^63-1`, span `2^64-1`, width 64.
+fn wrap_into(v: i128, lo: i128, hi: i128) -> i128 {
+    let span = hi.wrapping_sub(lo);
+    // `span + 1` is 2^bits; its trailing-zero count IS the width.
+    let bits = (span as u128).wrapping_add(1).trailing_zeros();
+    if bits == 0 || bits > 64 {
+        return v;
+    }
+    let len = 1i128 << bits;
+    let masked = v & (len - 1);
+    if lo < 0 && (masked >> (bits - 1)) & 1 == 1 {
+        masked - len
+    } else {
+        masked
+    }
+}
+
+pub(crate) fn fold_bin(op: BinOp, l: ConstFold, r: ConstFold) -> ConstFold {
     use BinOp::*;
     // Division/shift-by-huge and `TooBig` interactions are handled per-op.
     match op {
@@ -1190,12 +1372,118 @@ pub(crate) fn const_float_value(e: &Expr) -> Option<f64> {
     }
 }
 
+/// Fold a float constant expression, resolving identifiers via `consts`.
+pub(crate) fn const_float_fold_with(
+    e: &Expr,
+    consts: &HashMap<String, &Expr>,
+    depth: u32,
+    st: Option<&FnState>,
+) -> Option<f64> {
+    match unwrap_parens(e) {
+        Expr::Lit {
+            kind: LitKind::Float(s),
+            ..
+        } => {
+            let clean: String = s.chars().filter(|c| *c != '_').collect();
+            clean.parse::<f64>().ok()
+        }
+        Expr::Lit {
+            kind: LitKind::Int(s),
+            ..
+        } => {
+            let clean: String = s.chars().filter(|c| *c != '_').collect();
+            if let Some(ConstInt::Value(v)) = parse_int_lit(s) {
+                Some(v as f64)
+            } else if let Ok(f) = clean.parse::<f64>() {
+                Some(f)
+            } else {
+                None
+            }
+        }
+        Expr::Lit {
+            kind: LitKind::Char(c),
+            ..
+        } => Some(*c as u32 as f64),
+        Expr::Ident { name, .. } => {
+            if let Some(st) = st {
+                if st.env_lookup(name).is_some() {
+                    return None;
+                }
+            }
+            if depth < 16 {
+                if let Some(v) = consts.get(name) {
+                    return const_float_fold_with(v, consts, depth + 1, None);
+                }
+            }
+            None
+        }
+        Expr::Unary {
+            op: UnOp::Neg,
+            operand,
+            ..
+        } => const_float_fold_with(operand, consts, depth + 1, st).map(|v| -v),
+        Expr::Binary { op, lhs, rhs, .. } => {
+            let l = const_float_fold_with(lhs, consts, depth + 1, st)?;
+            let r = const_float_fold_with(rhs, consts, depth + 1, st)?;
+            match op {
+                BinOp::Add => Some(l + r),
+                BinOp::Sub => Some(l - r),
+                BinOp::Mul => Some(l * r),
+                BinOp::Div => {
+                    if r == 0.0 {
+                        None
+                    } else {
+                        Some(l / r)
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Returns true if `e` is an untyped float constant expression (contains at least one float literal or float const).
+fn is_float_const_expr(
+    e: &Expr,
+    consts: &HashMap<String, &Expr>,
+    depth: u32,
+    st: Option<&FnState>,
+) -> bool {
+    match unwrap_parens(e) {
+        Expr::Lit {
+            kind: LitKind::Float(_),
+            ..
+        } => true,
+        Expr::Lit { .. } => false,
+        Expr::Ident { name, .. } => {
+            if let Some(st) = st {
+                if st.env_lookup(name).is_some() {
+                    return false;
+                }
+            }
+            if depth < 16 {
+                if let Some(v) = consts.get(name) {
+                    return is_float_const_expr(v, consts, depth + 1, None);
+                }
+            }
+            false
+        }
+        Expr::Unary { operand, .. } => is_float_const_expr(operand, consts, depth + 1, st),
+        Expr::Binary { lhs, rhs, .. } => {
+            is_float_const_expr(lhs, consts, depth + 1, st)
+                || is_float_const_expr(rhs, consts, depth + 1, st)
+        }
+        _ => false,
+    }
+}
+
 /// Render a folded float as the nearest integer literal for the fix-it.
 fn integer_of_float(f: f64) -> String {
     format!("{}", f.trunc() as i128)
 }
 
-fn parse_int_lit(s: &str) -> Option<ConstInt> {
+pub(crate) fn parse_int_lit(s: &str) -> Option<ConstInt> {
     let clean: String = s.chars().filter(|c| *c != '_').collect();
     if clean.is_empty() {
         return None;
