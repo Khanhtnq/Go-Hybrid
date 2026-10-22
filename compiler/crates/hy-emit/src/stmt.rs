@@ -1366,7 +1366,9 @@ impl Emitter {
     /// Member-name normalization decision for a field/method access whose
     /// base's ROOT binding is `base` (an Ident chain root).
     pub fn member_name(&self, base: &Expr, name: &str) -> String {
-        if let Expr::Ident { name: root, .. } = base {
+        // `(x).f` resolves as `x.f`: a redundant receiver paren must not hide
+        // a package root or a foreign binding from the spelling decision.
+        if let Expr::Ident { name: root, .. } = Self::peel_parens(base) {
             if self.is_unshadowed_pkg_root(root) {
                 return to_go_name(name);
             }
@@ -1483,8 +1485,8 @@ impl Emitter {
                 if let Some(inherited) = self.branch_inherit.clone() {
                     self.push("} else {");
                     self.indent += 1;
-                    for (name, place) in inherited {
-                        self.push(&format!("{} = {}", place, name));
+                    for (_, store) in inherited {
+                        self.push(&store);
                     }
                     self.indent -= 1;
                 }
@@ -2245,8 +2247,8 @@ impl Emitter {
                     if let Some(inherited) = self.branch_inherit.clone() {
                         self.push("} else {");
                         self.indent += 1;
-                        for (name, place) in inherited {
-                            self.push(&format!("{} = {}", place, name));
+                        for (_, store) in inherited {
+                            self.push(&store);
                         }
                         self.indent -= 1;
                     }
@@ -2316,8 +2318,8 @@ impl Emitter {
                     if let Some(inherited) = self.branch_inherit.clone() {
                         self.push("} else {");
                         self.indent += 1;
-                        for (name, place) in inherited {
-                            self.push(&format!("{} = {}", place, name));
+                        for (_, store) in inherited {
+                            self.push(&store);
                         }
                         self.indent -= 1;
                     }
@@ -2400,8 +2402,8 @@ impl Emitter {
             } else if let Some(inherited) = self.branch_inherit.clone() {
                 self.push(&format!("if !{} {{", matched_temp));
                 self.indent += 1;
-                for (name, place) in inherited {
-                    self.push(&format!("{} = {}", place, name));
+                for (_, store) in inherited {
+                    self.push(&store);
                 }
                 self.indent -= 1;
                 self.push("}");
@@ -2555,8 +2557,8 @@ impl Emitter {
                     }
                 }
             }
-            for (name, place) in pre_flush {
-                self.push(&format!("{} = {}", place, name));
+            for (_, store) in pre_flush {
+                self.push(&store);
             }
             let saved_inherit = if handoff.is_empty() {
                 None
