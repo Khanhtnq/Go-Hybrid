@@ -97,9 +97,10 @@ func (h *Histogram) Mean() float64 {
 }
 
 // ValueAt returns the ns value the given fraction (0..1) of samples fall
-// at or below (the upper bound of the bucket that crosses the rank).
+// at or below (the upper bound of the bucket that crosses the rank, clamped
+// to [minVal, maxVal] so quantiles stay monotonic up to ValueAt(1.0)).
 func (h *Histogram) ValueAt(fraction float64) int64 {
-	if h.count == 0 {
+	if h.count == 0 || fraction != fraction {
 		return 0
 	}
 	if fraction <= 0 {
@@ -122,9 +123,19 @@ func (h *Histogram) ValueAt(fraction float64) int64 {
 					// (sub 0 is the dedicated zero bucket)
 					return int64(sub)
 				}
-				// implicit-leading-bit regime: re-add SubHalf
+				// implicit-leading-bit regime: re-add SubHalf in uint64
+				// so e=62/sub=1023 cannot overflow signed int64, then
+				// cap at [minVal, maxVal] so quantiles never exceed maxVal.
 				shift := uint(h.loShift[e])
-				return (SubHalf+int64(sub)+1)<<shift - 1
+				hi := (uint64(SubHalf+sub+1) << shift) - 1
+				if hi > uint64(h.maxVal) {
+					return h.maxVal
+				}
+				v := int64(hi)
+				if v < h.minVal {
+					return h.minVal
+				}
+				return v
 			}
 		}
 	}

@@ -1,6 +1,9 @@
 package hybench
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestRecordsAndRanks(t *testing.T) {
 	h := New()
@@ -79,5 +82,30 @@ func TestSummaryShape(t *testing.T) {
 	want := "workload-a p50="
 	if len(line) < len(want) || line[:len(want)] != want {
 		t.Fatalf("summary shape drifted: %q", line)
+	}
+}
+
+func TestQuantileMonotonicityAndBounds(t *testing.T) {
+	// Constant samples in the e >= 11 regime (shift >= 1) previously returned
+	// a bucket upper bound strictly greater than maxVal (e.g. Record(2048) ->
+	// P50() = 2049 > ValueAt(1.0) = 2048; Record(1_000_000_000) -> P99() =
+	// 1_000_341_503 > ValueAt(1.0) = 1_000_000_000).
+	for _, sample := range []int64{2048, 3000, 1_000_000_000, math.MaxInt64} {
+		h := New()
+		for i := 0; i < 10; i++ {
+			h.Record(sample)
+		}
+		if got := h.ValueAt(math.NaN()); got != 0 {
+			t.Fatalf("sample=%d: ValueAt(NaN) = %d, want 0", sample, got)
+		}
+		v0 := h.ValueAt(0.0)
+		p50 := h.P50()
+		p90 := h.P90()
+		p99 := h.P99()
+		v1 := h.ValueAt(1.0)
+		if v0 != sample || p50 != sample || p90 != sample || p99 != sample || v1 != sample {
+			t.Fatalf("sample=%d: expected all quantiles == %d, got v0=%d p50=%d p90=%d p99=%d v1=%d",
+				sample, sample, v0, p50, p90, p99, v1)
+		}
 	}
 }
