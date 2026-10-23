@@ -792,10 +792,15 @@ impl<'a> Checker<'a> {
                 if let TypeExpr::Named { name: rname, .. } = &resolved_conv {
                     if let Some((lo, hi)) = fixed_width_int_range(rname) {
                         let arg_expr = &args[0].value;
-                        let is_int_const = !matches!(
-                            const_int_fold_with(arg_expr, &self.const_values, 0, Some(st)),
-                            ConstFold::NotConst
+                        let is_spec_sub64_wrap = matches!(
+                            name.as_str(),
+                            "u8" | "i8" | "u16" | "i16" | "u32" | "i32"
                         );
+                        let is_int_const = !is_spec_sub64_wrap
+                            && !matches!(
+                                const_int_fold_with(arg_expr, &self.const_values, 0, Some(st)),
+                                ConstFold::NotConst
+                            );
                         let bad_float_const = const_float_value_with(
                             arg_expr,
                             &self.const_values,
