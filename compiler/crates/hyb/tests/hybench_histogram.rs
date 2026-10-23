@@ -23,6 +23,10 @@ fn hybench_histogram_bounds_and_go_unit_tests() {
         "ValueAt must clamp reconstructed bucket upper bounds to maxVal"
     );
     assert!(
+        hist_src.contains("minVal: 1<<63 - 1"),
+        "New must initialize minVal to math.MaxInt64 (1<<63 - 1)"
+    );
+    assert!(
         test_src.contains("TestQuantileMonotonicityAndBounds"),
         "histogram_test.go must include TestQuantileMonotonicityAndBounds"
     );

@@ -38,7 +38,7 @@ type Histogram struct {
 
 // New allocates a histogram. The zero value is NOT usable; always New.
 func New() *Histogram {
-	h := &Histogram{subMask: SubHalf - 1, minVal: 1<<62 - 1}
+	h := &Histogram{subMask: SubHalf - 1, minVal: 1<<63 - 1}
 	for e := 0; e < 64; e++ {
 		// exponent e covers magnitudes [2^e, 2^(e+1)); the sub-bucket
 		// index keeps the leading 1 implicit: shift so it drops off
