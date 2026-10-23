@@ -48,7 +48,16 @@ fn main() -> ExitCode {
         Some("build") => cmd_build(&args[1..]),
         Some("generate") => cmd_generate(&args[1..]),
         Some("vendor-runtime") => cmd_vendor_runtime(&args[1..]),
-        Some("bench-overhead") => cmd_bench_overhead(),
+        Some("bench-overhead") => {
+            if let Some(unexpected) = args.get(1) {
+                eprintln!(
+                    "error: bench-overhead takes no arguments; unexpected argument: {unexpected}\n\
+                     usage: hyb bench-overhead"
+                );
+                return ExitCode::from(2);
+            }
+            cmd_bench_overhead()
+        }
         _ => {
             eprintln!("hyb — the Hybrid compiler CLI (MVP-0)");
             eprintln!();
@@ -70,8 +79,33 @@ fn main() -> ExitCode {
 }
 
 fn cmd_explain(args: &[String]) -> ExitCode {
-    let Some(code) = args.first() else {
-        eprintln!("usage: hyb explain <code>");
+    const USAGE: &str = "usage: hyb explain [--] <code>";
+    let mut code = None;
+    let mut end_of_options = false;
+    for arg in args {
+        if !end_of_options {
+            match arg.as_str() {
+                "--" => {
+                    end_of_options = true;
+                    continue;
+                }
+                value if value.starts_with('-') => {
+                    eprintln!("unknown option: {value}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                _ => {}
+            }
+        }
+        if code.is_some() {
+            eprintln!(
+                "explain expects exactly one diagnostic code; unexpected argument: {arg}\n{USAGE}"
+            );
+            return ExitCode::from(2);
+        }
+        code = Some(arg);
+    }
+    let Some(code) = code else {
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
     match hy_diag::Registry::global().explain(code) {
@@ -641,12 +675,34 @@ fn generate_one(
 ///   replace hybrid.program => ./hybridrt
 /// and emitted imports resolve as ordinary local packages. Idempotent.
 fn cmd_vendor_runtime(args: &[String]) -> ExitCode {
-    let dir = match args.iter().find(|a| !a.starts_with("--")) {
-        Some(d) => std::path::PathBuf::from(d),
-        None => {
-            eprintln!("usage: hyb vendor-runtime <dir>  (creates <dir>/hybridrt)");
+    const USAGE: &str = "usage: hyb vendor-runtime [--] <dir>  (creates <dir>/hybridrt)";
+    let mut dir = None;
+    let mut end_of_options = false;
+    for arg in args {
+        if !end_of_options {
+            match arg.as_str() {
+                "--" => {
+                    end_of_options = true;
+                    continue;
+                }
+                value if value.starts_with('-') => {
+                    eprintln!("error: unknown vendor-runtime option: {value}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                _ => {}
+            }
+        }
+        if dir.is_some() {
+            eprintln!(
+                "error: vendor-runtime expects exactly one target directory; unexpected argument: {arg}\n{USAGE}"
+            );
             return ExitCode::from(2);
         }
+        dir = Some(std::path::PathBuf::from(arg));
+    }
+    let Some(dir) = dir else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
     };
     let rt = match runtime_dir() {
         Ok(r) => r,
@@ -722,29 +778,83 @@ fn render_build_error(e: &BuildError) -> String {
 }
 
 fn cmd_build(args: &[String]) -> ExitCode {
-    // The .hy file: the first arg ending in .hy (flag values never do).
-    let file = args.iter().find(|a| a.ends_with(".hy")).cloned();
+    const USAGE: &str =
+        "usage: hyb build <file.hy> -o <bin-path> [--emit-go] | --package <name> --out-dir <dir> [--binding-prefix <path>]";
+    let mut file: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut emit_go_only = false;
+    let mut pkg_name: Option<String> = None;
+    let mut out_dir: Option<String> = None;
+    let mut binding_prefix: Option<String> = None;
+    let mut end_of_options = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if !end_of_options {
+            match arg.as_str() {
+                "--" => {
+                    end_of_options = true;
+                    continue;
+                }
+                "--emit-go" => {
+                    emit_go_only = true;
+                    continue;
+                }
+                opt @ ("-o" | "--package" | "--out-dir" | "--binding-prefix") => {
+                    let slot = match opt {
+                        "-o" => &mut out_path,
+                        "--package" => &mut pkg_name,
+                        "--out-dir" => &mut out_dir,
+                        "--binding-prefix" => &mut binding_prefix,
+                        _ => unreachable!(),
+                    };
+                    if slot.is_some() {
+                        eprintln!("error: {opt} may only be supplied once\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                    let Some(value) = iter.next() else {
+                        eprintln!("error: {opt} requires a value\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    if value.is_empty() || value.starts_with('-') {
+                        eprintln!("error: {opt} requires a value, not an option\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                    *slot = Some(value.clone());
+                    continue;
+                }
+                value if value.starts_with('-') => {
+                    eprintln!("error: unknown build option: {value}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                _ => {}
+            }
+        }
+        if file.is_some() {
+            eprintln!(
+                "error: build expects exactly one input file; unexpected argument: {arg}\n{USAGE}"
+            );
+            return ExitCode::from(2);
+        }
+        file = Some(arg.clone());
+    }
     let Some(file) = file else {
-        eprintln!("usage: hyb build <file.hy> -o <bin-path> [--emit-go] | --package <name> --out-dir <dir> [--binding-prefix <path>]");
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let out_idx = args.iter().position(|a| a == "-o");
-    let out_path = out_idx
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "a.out".to_string());
-    let emit_go_only = args.iter().any(|a| a == "--emit-go");
-    // Package mode (example 09): emit an importable Go package + the
-    // runtime pieces, instead of building a binary.
-    let pkg_idx = args.iter().position(|a| a == "--package");
-    let pkg_name = pkg_idx.and_then(|i| args.get(i + 1)).cloned();
-    let outdir_idx = args.iter().position(|a| a == "--out-dir");
-    let out_dir = outdir_idx.and_then(|i| args.get(i + 1)).cloned();
-    let bprefix_idx = args.iter().position(|a| a == "--binding-prefix");
-    let binding_prefix = bprefix_idx
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "hybrid.program".to_string());
+    if pkg_name.is_some() != out_dir.is_some() {
+        eprintln!("error: --package and --out-dir must be supplied together\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    if pkg_name.is_some() && (out_path.is_some() || emit_go_only) {
+        eprintln!("error: --package mode cannot be combined with -o or --emit-go\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    if pkg_name.is_none() && binding_prefix.is_some() {
+        eprintln!("error: --binding-prefix requires --package and --out-dir\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    let out_path = out_path.unwrap_or_else(|| "a.out".to_string());
+    let binding_prefix = binding_prefix.unwrap_or_else(|| "hybrid.program".to_string());
 
     // --- 1. Toolchain pin enforcement (HYB-E9001) ---
     // The walking skeleton's reproducibility guard (DX study: ~30 lines).
