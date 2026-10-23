@@ -790,19 +790,20 @@ impl<'a> Checker<'a> {
                 };
                 let resolved_conv = self.resolve_type_alias(&conv_ty);
                 if let TypeExpr::Named { name: rname, .. } = &resolved_conv {
-                    if fixed_width_int_range(rname).is_some() {
+                    if let Some((lo, hi)) = fixed_width_int_range(rname) {
                         let arg_expr = &args[0].value;
-                        let is_const = !matches!(
+                        let is_int_const = !matches!(
                             const_int_fold_with(arg_expr, &self.const_values, 0, Some(st)),
                             ConstFold::NotConst
-                        ) || const_float_value_with(
+                        );
+                        let bad_float_const = const_float_value_with(
                             arg_expr,
                             &self.const_values,
                             0,
                             Some(st),
                         )
-                        .is_some();
-                        if is_const {
+                        .is_some_and(|f| !(f.fract() == 0.0 && f >= lo as f64 && f <= hi as f64));
+                        if is_int_const || bad_float_const {
                             self.check_const_overflow_init(
                                 &format!("type conversion `{}`", name),
                                 &resolved_conv,
